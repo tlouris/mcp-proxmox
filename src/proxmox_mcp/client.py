@@ -287,8 +287,11 @@ class ProxmoxClient:
             "ostemplate": ostemplate if ":" in ostemplate else f"{storage_id}:vztmpl/{ostemplate}",
             "rootfs": rootfs,
             "net0": net0,
-            "password": os.environ.get("PROXMOX_DEFAULT_LXC_PASSWORD", "changeMe123!"),
         }
+        # Without a password PVE leaves root's password locked; access via `pct enter` or SSH keys.
+        password = os.environ.get("PROXMOX_DEFAULT_LXC_PASSWORD")
+        if password:
+            params["password"] = password
         return self._api.nodes(node).lxc.post(**params)
 
     def delete_lxc(self, node: str, vmid: int, purge: bool = True) -> str:
