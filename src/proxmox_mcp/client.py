@@ -226,7 +226,7 @@ class ProxmoxClient:
         return self._api.nodes(node).qemu.post(**params)
 
     def delete_vm(self, node: str, vmid: int, purge: bool = True) -> str:
-        return self._api.nodes(node).qemu(vmid).delete.post(purge=int(purge))
+        return self._api.nodes(node).qemu(vmid).delete(purge=int(purge))
 
     def start_vm(self, node: str, vmid: int) -> str:
         return self._api.nodes(node).qemu(vmid).status.start.post()
@@ -370,7 +370,7 @@ class ProxmoxClient:
         return self._api.nodes(node).qemu(vmid).snapshot.post(**params)
 
     def delete_snapshot(self, node: str, vmid: int, name: str) -> str:
-        return self._api.nodes(node).qemu(vmid).snapshot(name).delete.post()
+        return self._api.nodes(node).qemu(vmid).snapshot(name).delete()
 
     def rollback_snapshot(self, node: str, vmid: int, name: str) -> str:
         return self._api.nodes(node).qemu(vmid).snapshot(name).rollback.post()
