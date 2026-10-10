@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -448,16 +449,45 @@ class ProxmoxClient:
                 raise TimeoutError(f"Task {upid} did not complete within {timeout}s")
             time.sleep(poll_interval)
 
-    def qga_exec(self, node: str, vmid: int, command: str, args: Optional[List[str]] = None, input_data: Optional[str] = None) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {"command": command}
+    def qga_exec(
+        self,
+        node: str,
+        vmid: int,
+        command: str,
+        args: Optional[List[str]] = None,
+        input_data: Optional[str] = None,
+        wait: bool = True,
+        timeout: int = 60,
+    ) -> Dict[str, Any]:
+        # agent/exec has no "args" parameter: program + arguments go in one "command" array.
         if args:
-            payload["args"] = args
+            argv = [command, *args]
+        elif any(ch.isspace() for ch in command) and not str(self.vm_config(node, vmid).get("ostype", "")).startswith("win"):
+            # POSIX-split only for non-Windows guests; it would eat backslashes in "C:\Program Files\..." paths.
+            argv = shlex.split(command)
+        else:
+            argv = [command]
+        payload: Dict[str, Any] = {"command": argv}
         if input_data is not None:
             payload["input-data"] = input_data
-        return self._api.nodes(node).qemu(vmid).agent.exec.post(**payload)
+        agent = self._api.nodes(node).qemu(vmid).agent
+        pid = agent.exec.post(**payload)["pid"]
+        if not wait:
+            return {"pid": pid}
+
+        # exec only starts the process; its exit code and output come from exec-status.
+        deadline = time.monotonic() + timeout
+        while True:
+            status = agent("exec-status").get(pid=pid)
+            if status.get("exited"):
+                return {"pid": pid, **status}
+            if time.monotonic() >= deadline:
+                return {"pid": pid, **status, "timed_out": True}
+            time.sleep(0.5)
 
     def qga_network_get_interfaces(self, node: str, vmid: int) -> Dict[str, Any]:
-        return self._api.nodes(node).qemu(vmid).agent["network-get-interfaces"].get()
+        # ProxmoxResource has no __getitem__; call syntax appends hyphenated path segments.
+        return self._api.nodes(node).qemu(vmid).agent("network-get-interfaces").get()
 
     # -------- CloudInit and template management --------
     def create_cloudinit_vm(
@@ -873,7 +903,7 @@ Write-Host "RDP disabled successfully"
             # Get guest info if QEMU agent is available
             guest_info = {}
             try:
-                guest_info = self.qga_exec(node, vmid, command="guest-info")
+                guest_info = self._api.nodes(node).qemu(vmid).agent("info").get()
             except Exception:
                 pass  # QEMU agent not available or VM not running
             
@@ -919,7 +949,7 @@ Write-Host "RDP disabled successfully"
         
         try:
             result = self.qga_exec(node, vmid, command=cmd, args=args)
-            return {"success": True, "result": result}
+            return {"success": result.get("exitcode") == 0, "result": result}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -968,7 +998,7 @@ Get-WindowsUpdate -Install -AcceptAll -AutoReboot
         """Execute Docker command on VM."""
         try:
             result = self.qga_exec(node, vmid, command="bash", args=["-c", command])
-            return {"success": True, "result": result}
+            return {"success": result.get("exitcode") == 0, "result": result}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
