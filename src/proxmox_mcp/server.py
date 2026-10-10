@@ -839,7 +839,7 @@ async def proxmox_restore_vm(node: Optional[str] = None, vmid: int = 0, archive:
     require_confirm(confirm)
     if dry_run:
         return {"dry_run": True, "action": "restore-vm", "params": {"node": node_id, "vmid": vmid, "archive": archive, "storage": storage, "force": force}}
-    upid = client.restore_vm(node_id, vmid, archive=archive, storage=storage or client.default_storage, force=force)
+    upid = client.restore_vm(node_id, vmid, archive=archive, storage=storage, force=force)
     result: Dict[str, Any] = {"upid": upid}
     if wait:
         status = client.wait_task(upid, node=node_id, timeout=timeout, poll_interval=poll_interval)

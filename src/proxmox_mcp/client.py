@@ -386,10 +386,30 @@ class ProxmoxClient:
         return self._api.nodes(node).vzdump.post(**params)
 
     def restore_vm(self, node: str, vmid: int, archive: str, storage: Optional[str] = None, force: bool = False) -> str:
-        params: Dict[str, Any] = {"vmid": vmid, "archive": archive, "force": int(force)}
+        # PVE has no restore endpoint: a restore is a create on the qemu or lxc collection from a backup archive.
+        subtype = None
+        if ":" in archive:
+            store_id = archive.split(":", 1)[0]
+            subtype = next((e.get("subtype") for e in self.storage_content(node, store_id) if e.get("volid") == archive), None)
+        if subtype is None:
+            filename = archive.replace("\\", "/").rsplit("/", 1)[-1]
+            subtype = "lxc" if filename.startswith("vzdump-lxc-") else "qemu" if filename.startswith("vzdump-qemu-") else None
+        if subtype not in ("qemu", "lxc"):
+            raise ValueError(
+                f"{archive} is not a recognised backup on node {node}: it is not listed as a VM/container backup "
+                "in its storage, and its filename does not start with vzdump-qemu- or vzdump-lxc-"
+            )
+
+        params: Dict[str, Any] = {"vmid": vmid, "force": int(force)}
+        if subtype == "lxc":
+            if not storage:
+                # PVE's LXC create defaults storage to 'local' rather than the storage recorded in the backup.
+                raise ValueError("Container restores need a target storage (e.g. 'local-lvm'); PVE would otherwise use 'local'")
+            return self._api.nodes(node).lxc.post(ostemplate=archive, restore=1, storage=storage, **params)
+        # For VMs, omitting storage puts each disk back on the storage recorded in the backup.
         if storage:
             params["storage"] = storage
-        return self._api.nodes(node).qemu.restore.post(**params)
+        return self._api.nodes(node).qemu.post(archive=archive, **params)
 
     # -------- Metrics --------
     def vm_metrics(self, node: str, vmid: int, timeframe: str = "hour", cf: str = "AVERAGE") -> List[Dict[str, Any]]:
