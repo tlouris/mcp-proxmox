@@ -82,7 +82,8 @@ class ProxmoxClient:
         return vms
 
     def list_lxc(self, node: Optional[str] = None, status: Optional[str] = None, search: Optional[str] = None) -> List[Dict[str, Any]]:
-        lxcs = self._api.cluster.resources.get(type="lxc")
+        # /cluster/resources only accepts type=vm|storage|node|sdn; containers come back under "vm" tagged type=lxc.
+        lxcs = [r for r in self._api.cluster.resources.get(type="vm") if r.get("type") == "lxc"]
         if node:
             lxcs = [c for c in lxcs if c.get("node") == node]
         if status:
@@ -92,47 +93,44 @@ class ProxmoxClient:
             lxcs = [c for c in lxcs if s in str(c.get("name", "")).lower()]
         return lxcs
 
-    def resolve_vm(self, vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None) -> Tuple[int, str, Dict[str, Any]]:
-        resources = self._api.cluster.resources.get(type="vm")
-        candidates: List[Dict[str, Any]] = []
+    def _resolve_guest(self, kinds: Tuple[str, ...], vmid: Optional[int], name: Optional[str], node: Optional[str]) -> Tuple[int, str, Dict[str, Any]]:
+        # type=vm returns both QEMU ("qemu") and container ("lxc") rows; callers pick which kinds their endpoints accept.
         if vmid is not None:
-            candidates = [r for r in resources if r.get("vmid") == vmid]
+            matches = [r for r in self._api.cluster.resources.get(type="vm") if r.get("vmid") == vmid]
         elif name is not None:
-            candidates = [r for r in resources if r.get("name") == name]
+            matches = [r for r in self._api.cluster.resources.get(type="vm") if r.get("name") == name]
         else:
             raise ValueError("Provide either vmid or name")
-
         if node:
-            candidates = [r for r in candidates if r.get("node") == node]
+            matches = [r for r in matches if r.get("node") == node]
 
+        candidates = [r for r in matches if r.get("type") in kinds]
+        selector = vmid if vmid is not None else name
         if not candidates:
-            raise ValueError("VM not found with given selector")
+            if kinds == ("qemu",) and any(r.get("type") == "lxc" for r in matches):
+                raise ValueError(
+                    f"{selector} is an LXC container, not a QEMU VM. Container tools: proxmox-lxc-info, proxmox-start-lxc, "
+                    "proxmox-stop-lxc, proxmox-configure-lxc, proxmox-delete-lxc, proxmox-lxc-notes-*, proxmox-backup-vm. "
+                    "Proxmox has no exec API for containers; run `pct exec <vmid> -- <cmd>` on the node instead of guest-exec."
+                )
+            if kinds == ("lxc",) and any(r.get("type") == "qemu" for r in matches):
+                raise ValueError(f"{selector} is a QEMU VM, not an LXC container; use the proxmox-*-vm tools")
+            raise ValueError(f"{'LXC' if kinds == ('lxc',) else 'VM'} not found with given selector")
         if len(candidates) > 1 and not node:
-            raise ValueError("Multiple VMs match name; specify node")
+            raise ValueError(f"Multiple {'LXCs' if kinds == ('lxc',) else 'VMs'} match name; specify node")
 
-        vm = candidates[0]
-        return int(vm["vmid"]), str(vm["node"]), vm
+        guest = candidates[0]
+        return int(guest["vmid"]), str(guest["node"]), guest
+
+    def resolve_vm(self, vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None) -> Tuple[int, str, Dict[str, Any]]:
+        return self._resolve_guest(("qemu",), vmid, name, node)
 
     def resolve_lxc(self, vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None) -> Tuple[int, str, Dict[str, Any]]:
-        resources = self._api.cluster.resources.get(type="lxc")
-        candidates: List[Dict[str, Any]] = []
-        if vmid is not None:
-            candidates = [r for r in resources if r.get("vmid") == vmid]
-        elif name is not None:
-            candidates = [r for r in resources if r.get("name") == name]
-        else:
-            raise ValueError("Provide either vmid or name")
+        return self._resolve_guest(("lxc",), vmid, name, node)
 
-        if node:
-            candidates = [r for r in candidates if r.get("node") == node]
-
-        if not candidates:
-            raise ValueError("LXC not found with given selector")
-        if len(candidates) > 1 and not node:
-            raise ValueError("Multiple LXCs match name; specify node")
-
-        ct = candidates[0]
-        return int(ct["vmid"]), str(ct["node"]), ct
+    def resolve_guest(self, vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None) -> Tuple[int, str, Dict[str, Any]]:
+        """Resolve a VM or container for type-agnostic endpoints (e.g. vzdump); row["type"] is "qemu" or "lxc"."""
+        return self._resolve_guest(("qemu", "lxc"), vmid, name, node)
 
     def vm_config(self, node: str, vmid: int) -> Dict[str, Any]:
         return self._api.nodes(node).qemu(vmid).config.get()
@@ -294,18 +292,19 @@ class ProxmoxClient:
         return self._api.nodes(node).lxc.post(**params)
 
     def delete_lxc(self, node: str, vmid: int, purge: bool = True) -> str:
-        return self._api.nodes(node).lxc(vmid).delete.post(purge=int(purge))
+        # proxmoxer's .delete is the HTTP DELETE method, not a path segment.
+        return self._api.nodes(node).lxc(vmid).delete(purge=int(purge))
 
     def start_lxc(self, node: str, vmid: int) -> str:
         return self._api.nodes(node).lxc(vmid).status.start.post()
 
     def stop_lxc(self, node: str, vmid: int, timeout: Optional[int] = None) -> str:
-        params: Dict[str, Any] = {}
-        if timeout is not None:
-            params["timeout"] = int(timeout)
-        return self._api.nodes(node).lxc(vmid).status.stop.post(**params)
+        # /status/stop rejects "timeout" (that belongs to /status/shutdown); callers use it only for wait_task.
+        return self._api.nodes(node).lxc(vmid).status.stop.post()
 
     def configure_lxc(self, node: str, vmid: int, params: Dict[str, Any]) -> Dict[str, Any]:
+        # JSON booleans would be sent as "True"/"False"; the PVE API expects 1/0.
+        params = {k: int(v) if isinstance(v, bool) else v for k, v in params.items()}
         upid = self._api.nodes(node).lxc(vmid).config.put(**params)
         return {"upid": upid} if isinstance(upid, str) else {"result": upid}
 
@@ -762,9 +761,10 @@ class ProxmoxClient:
     def get_cluster_vms(self, cluster_name: str) -> List[Dict[str, Any]]:
         """Get all VMs belonging to a cluster."""
         all_vms = self.list_vms()
+        # Callers drive these guests through the QEMU guest agent, so containers can't be swarm/cluster members.
         cluster_vms = [
-            vm for vm in all_vms 
-            if vm.get("name", "").startswith(f"{cluster_name}-")
+            vm for vm in all_vms
+            if vm.get("type") == "qemu" and vm.get("name", "").startswith(f"{cluster_name}-")
         ]
         return cluster_vms
 

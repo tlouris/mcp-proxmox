@@ -816,7 +816,7 @@ async def proxmox_rollback_snapshot(vmid: Optional[int] = None, name: Optional[s
 @server.tool("proxmox-backup-vm")
 async def proxmox_backup_vm(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None, mode: str = "snapshot", compress: str = "zstd", storage: Optional[str] = None, confirm: Optional[bool] = None, dry_run: bool = False, wait: bool = True, timeout: int = 3600, poll_interval: float = 5.0) -> Dict[str, Any]:
     client = get_client()
-    vm_vmid, vm_node, _ = client.resolve_vm(vmid=vmid, name=name, node=node)
+    vm_vmid, vm_node, _ = client.resolve_guest(vmid=vmid, name=name, node=node)
     require_confirm(confirm)
     if dry_run:
         return {"dry_run": True, "action": "backup-vm", "params": {"node": vm_node, "vmid": vm_vmid, "mode": mode, "compress": compress, "storage": storage}}
