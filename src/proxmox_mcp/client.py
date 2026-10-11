@@ -161,13 +161,14 @@ class ProxmoxClient:
         return tasks[:limit]
 
     def task_status(self, upid: str, node: Optional[str] = None) -> Dict[str, Any]:
-        # If node is unknown, try cluster lookup then fall back to nodes
-        try:
-            return self._api.cluster.tasks(upid).status.get()
-        except Exception:
-            if not node:
-                raise
-            return self._api.nodes(node).tasks(upid).status.get()
+        # Status only exists at /nodes/{node}/tasks/{upid}/status, and the UPID names its own node:
+        # UPID:<node>:<pid>:<pstart>:<starttime>:<type>:<id>:<user>:
+        parts = upid.split(":")
+        if len(parts) >= 3 and parts[0] == "UPID" and parts[1]:
+            node = parts[1]
+        if not node:
+            raise ValueError(f"Invalid UPID {upid!r}: expected 'UPID:<node>:...' (or pass node)")
+        return self._api.nodes(node).tasks(upid).status.get()
 
     # -------- VM lifecycle --------
     def clone_vm(
