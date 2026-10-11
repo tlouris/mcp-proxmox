@@ -327,9 +327,7 @@ async def proxmox_clone_vm(
     poll_interval: float = 2.0,
 ) -> Dict[str, Any]:
     client = get_client()
-    node = source_node or client.default_node
-    if not node:
-        raise ValueError("source_node is required (or set PROXMOX_DEFAULT_NODE)")
+    source_vmid, node, _ = client.resolve_vm(vmid=source_vmid, node=source_node)
     require_confirm(confirm)
     if dry_run:
         return {
@@ -352,7 +350,7 @@ async def proxmox_clone_vm(
         new_vmid=new_vmid,
         name=name,
         full=full,
-        storage=storage or client.default_storage,
+        storage=storage,
     )
     result: Dict[str, Any] = {"upid": upid}
     if wait:
@@ -820,7 +818,7 @@ async def proxmox_backup_vm(vmid: Optional[int] = None, name: Optional[str] = No
     require_confirm(confirm)
     if dry_run:
         return {"dry_run": True, "action": "backup-vm", "params": {"node": vm_node, "vmid": vm_vmid, "mode": mode, "compress": compress, "storage": storage}}
-    upid = client.backup_vm(vm_node, vm_vmid, mode=mode, compress=compress, storage=storage or client.default_storage)
+    upid = client.backup_vm(vm_node, vm_vmid, mode=mode, compress=compress, storage=storage)
     result: Dict[str, Any] = {"upid": upid}
     if wait:
         status = client.wait_task(upid, node=vm_node, timeout=timeout, poll_interval=poll_interval)

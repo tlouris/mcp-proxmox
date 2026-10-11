@@ -236,7 +236,8 @@ class ProxmoxClient:
     def stop_vm(self, node: str, vmid: int, force: bool = False, timeout: Optional[int] = None) -> str:
         params: Dict[str, Any] = {}
         if force:
-            params["forceStop"] = 1
+            # /status/stop is already immediate; "forceStop" only exists on /status/shutdown.
+            params["overrule-shutdown"] = 1
         if timeout is not None:
             params["timeout"] = int(timeout)
         return self._api.nodes(node).qemu(vmid).status.stop.post(**params)
@@ -263,6 +264,18 @@ class ProxmoxClient:
         return {"upid": upid} if isinstance(upid, str) else {"result": upid}
 
     # -------- LXC lifecycle --------
+    def _find_template(self, node: str, filename: str) -> str:
+        """Resolve a bare template filename to its volid on any template-capable storage of the node."""
+        for st in self._api.nodes(node).storage.get(content="vztmpl", enabled=1):
+            try:
+                items = self._api.nodes(node).storage(st["storage"]).content.get(content="vztmpl")
+            except Exception:
+                continue  # e.g. a hung CIFS share shouldn't block finding the template elsewhere
+            for item in items:
+                if str(item.get("volid", "")).rsplit("/", 1)[-1] == filename:
+                    return item["volid"]
+        raise ValueError(f"Template {filename!r} not found on any template storage of {node}; pass the full volid")
+
     def create_lxc(
         self,
         *,
@@ -286,7 +299,7 @@ class ProxmoxClient:
             "hostname": hostname,
             "cores": cores,
             "memory": memory_mb,
-            "ostemplate": ostemplate if ":" in ostemplate else f"{storage_id}:vztmpl/{ostemplate}",
+            "ostemplate": ostemplate if ":" in ostemplate else self._find_template(node, ostemplate),
             "rootfs": rootfs,
             "net0": net0,
         }
@@ -382,6 +395,8 @@ class ProxmoxClient:
 
     def backup_vm(self, node: str, vmid: int, mode: str = "snapshot", compress: str = "zstd", storage: Optional[str] = None) -> str:
         params: Dict[str, Any] = {"vmid": vmid, "mode": mode, "compress": compress}
+        # Without a storage, PVE falls back to /etc/vzdump.conf's storage, then 'local'.
+        storage = storage or os.environ.get("PROXMOX_DEFAULT_BACKUP_STORAGE")
         if storage:
             params["storage"] = storage
         return self._api.nodes(node).vzdump.post(**params)
