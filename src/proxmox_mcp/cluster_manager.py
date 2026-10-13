@@ -139,6 +139,7 @@ class ClusterRegistry:
                 default_node=cluster_config.default_node,
                 default_storage=cluster_config.default_storage,
                 default_bridge=cluster_config.default_bridge,
+                fallback_urls=cluster_config.fallback_urls,
             )
             
             self._clients[target_cluster] = client

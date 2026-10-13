@@ -18,6 +18,7 @@ class ProxmoxEnv:
     default_node: Optional[str] = None
     default_storage: Optional[str] = None
     default_bridge: Optional[str] = None
+    fallback_urls: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -33,6 +34,7 @@ class ClusterConfig:
     default_bridge: Optional[str] = None
     region: Optional[str] = None
     tier: Optional[str] = None
+    fallback_urls: List[str] = field(default_factory=list)
     
     def to_proxmox_env(self) -> ProxmoxEnv:
         """Convert ClusterConfig to ProxmoxEnv format."""
@@ -44,6 +46,7 @@ class ClusterConfig:
             default_node=self.default_node,
             default_storage=self.default_storage,
             default_bridge=self.default_bridge,
+            fallback_urls=list(self.fallback_urls),
         )
 
 
@@ -68,6 +71,16 @@ def is_multi_cluster_mode() -> bool:
     return "PROXMOX_CLUSTERS" in os.environ
 
 
+def parse_url_list(value: Optional[str], var_name: str) -> List[str]:
+    """Split a comma-separated list of API URLs (e.g. a *_FALLBACK_API_URL variable), validating each entry."""
+    urls = [u.strip() for u in (value or "").split(",") if u.strip()]
+    for url in urls:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.hostname:
+            raise ValueError(f"Invalid URL in {var_name}: {url}")
+    return urls
+
+
 def read_env() -> ProxmoxEnv:
     """Read single cluster configuration (backward compatible)."""
     base_url = os.environ.get("PROXMOX_API_URL", "").strip()
@@ -78,6 +91,10 @@ def read_env() -> ProxmoxEnv:
     default_node = os.environ.get("PROXMOX_DEFAULT_NODE") or None
     default_storage = os.environ.get("PROXMOX_DEFAULT_STORAGE") or None
     default_bridge = os.environ.get("PROXMOX_DEFAULT_BRIDGE") or None
+    # Optional PROXMOX_FALLBACK_API_URL: other nodes of the same cluster, comma-separated
+    # (e.g. https://10.0.0.94:8006). When the current API URL fails to connect (timeout/refused/DNS),
+    # that request is retried on the next URL, which then stays in use. The same token is used for all.
+    fallback_urls = parse_url_list(os.environ.get("PROXMOX_FALLBACK_API_URL"), "PROXMOX_FALLBACK_API_URL")
 
     if not base_url:
         raise ValueError("Missing PROXMOX_API_URL")
@@ -94,6 +111,7 @@ def read_env() -> ProxmoxEnv:
         default_node=default_node,
         default_storage=default_storage,
         default_bridge=default_bridge,
+        fallback_urls=fallback_urls,
     )
 
 
@@ -106,6 +124,7 @@ def read_multi_cluster_env() -> Dict[str, ClusterConfig]:
         PROXMOX_CLUSTER_cluster1_API_URL=...
         PROXMOX_CLUSTER_cluster1_TOKEN_ID=...
         PROXMOX_CLUSTER_cluster1_TOKEN_SECRET=...
+        PROXMOX_CLUSTER_cluster1_FALLBACK_API_URL=...  (optional; see below)
         etc.
     """
     clusters_str = os.environ.get("PROXMOX_CLUSTERS", "").strip()
@@ -142,6 +161,10 @@ def read_multi_cluster_env() -> Dict[str, ClusterConfig]:
         default_bridge = os.environ.get(f"{prefix}DEFAULT_BRIDGE") or None
         region = os.environ.get(f"{prefix}REGION") or None
         tier = os.environ.get(f"{prefix}TIER") or None
+        # Optional PROXMOX_CLUSTER_<name>_FALLBACK_API_URL: other nodes of this cluster, comma-separated
+        # (e.g. https://10.0.0.94:8006). When the current API URL fails to connect (timeout/refused/DNS),
+        # that request is retried on the next URL, which then stays in use. The cluster's token is used for all.
+        fallback_urls = parse_url_list(os.environ.get(f"{prefix}FALLBACK_API_URL"), f"{prefix}FALLBACK_API_URL")
         
         config = ClusterConfig(
             name=cluster_name,
@@ -154,6 +177,7 @@ def read_multi_cluster_env() -> Dict[str, ClusterConfig]:
             default_bridge=default_bridge,
             region=region,
             tier=tier,
+            fallback_urls=fallback_urls,
         )
         
         clusters[cluster_name] = config
@@ -200,6 +224,7 @@ def load_cluster_registry_config() -> ClusterRegistryConfig:
             default_node=env.default_node,
             default_storage=env.default_storage,
             default_bridge=env.default_bridge,
+            fallback_urls=env.fallback_urls,
         )
         
         return ClusterRegistryConfig(

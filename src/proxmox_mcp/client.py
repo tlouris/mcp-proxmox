@@ -1,13 +1,98 @@
 from __future__ import annotations
 
+import io
 import os
 import shlex
+import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
+import requests
 from proxmoxer import ProxmoxAPI
+from proxmoxer.backends.https import ProxmoxHttpSession
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
 from .utils import parse_api_url, read_env, split_token_id
+
+
+# Index of the API URL that last answered, per configured URL list. Module-level because single-cluster mode
+# builds a new ProxmoxClient for every tool call, and the choice has to outlive the instance.
+_ACTIVE_URL: Dict[Tuple[str, ...], int] = {}
+_ACTIVE_URL_LOCK = threading.Lock()
+
+
+def _is_connect_failure(exc: BaseException) -> bool:
+    """True only when the request never reached a server: connect timeout, connection refused/unreachable, DNS failure."""
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return True
+    if type(exc) is not requests.exceptions.ConnectionError:
+        return False  # ReadTimeout, SSLError, ProxyError, ...: the server may already have the request
+    cause = exc.args[0] if exc.args else None
+    cause = getattr(cause, "reason", cause)  # requests wraps urllib3's MaxRetryError around the real cause
+    # NewConnectionError covers refused/unreachable and (as NameResolutionError) DNS; a dropped connection
+    # mid-request is a ProtocolError instead and is not retried.
+    return isinstance(cause, (NewConnectionError, ConnectTimeoutError))
+
+
+class _FailoverSession(ProxmoxHttpSession):
+    """Sends each request to the cluster API URL that last answered; on a connect-phase failure, retries it on the next one.
+
+    Only connect-phase failures switch URLs, so a POST/PUT/DELETE is never sent twice: the first attempt never
+    reached a server. HTTP errors (4xx/5xx, including PVE's 595 for an unreachable node) are answers, not failures.
+    Each URL is tried at most once per request, and the URL that answers stays in use for later requests.
+    """
+
+    def __init__(self, prefixes: List[str]) -> None:
+        super().__init__()
+        self._prefixes = prefixes  # "https://host:port/api2/json" per configured URL, primary first
+        self._key = tuple(prefixes)
+
+    def request(self, method, url, *args, **kwargs):
+        primary = self._prefixes[0]
+        if not url.startswith(primary):
+            return super().request(method, url, *args, **kwargs)
+        path = url[len(primary):]
+        data = kwargs.get("data")
+        streams = [v for v in data.values() if isinstance(v, io.IOBase)] if isinstance(data, dict) else []
+        try:
+            rewind: Optional[List[Tuple[Any, int]]] = [(s, s.tell()) for s in streams]
+        except (OSError, ValueError):
+            rewind = None  # an unseekable upload body can't be resent
+
+        with _ACTIVE_URL_LOCK:
+            start = _ACTIVE_URL.get(self._key, 0)
+        count = len(self._prefixes)
+        for attempt in range(count):
+            idx = (start + attempt) % count
+            if isinstance(data, dict):
+                kwargs["data"] = dict(data)  # ProxmoxHttpSession.request moves file objects out of `data` in place
+            try:
+                response = super().request(method, self._prefixes[idx] + path, *args, **kwargs)
+            except requests.exceptions.RequestException as exc:
+                if attempt == count - 1 or rewind is None or not _is_connect_failure(exc):
+                    raise
+                for stream, pos in rewind:
+                    stream.seek(pos)
+                nxt = (idx + 1) % count
+                print(
+                    f"proxmox-mcp: Proxmox API {urlsplit(self._prefixes[idx]).netloc} unreachable "
+                    f"({type(exc).__name__}); retrying {method} {path} via {urlsplit(self._prefixes[nxt]).netloc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            if idx != start:
+                with _ACTIVE_URL_LOCK:
+                    _ACTIVE_URL[self._key] = idx
+                print(
+                    f"proxmox-mcp: Proxmox API calls now go to {urlsplit(self._prefixes[idx]).netloc} "
+                    f"(was {urlsplit(self._prefixes[start]).netloc})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return response
 
 
 class ProxmoxClient:
@@ -24,6 +109,8 @@ class ProxmoxClient:
         default_storage: Optional[str] = None,
         default_bridge: Optional[str] = None,
         timeout: int = 30,
+        fallback_urls: Optional[List[str]] = None,
+        connect_timeout: int = 5,
     ) -> None:
         self.base_url = base_url
         self.token_id = token_id
@@ -33,6 +120,7 @@ class ProxmoxClient:
         self.default_storage = default_storage
         self.default_bridge = default_bridge
         self.timeout = timeout
+        self.fallback_urls = list(fallback_urls or [])
 
         url = parse_api_url(base_url)
         token_parts = split_token_id(token_id)
@@ -43,8 +131,35 @@ class ProxmoxClient:
             token_name=token_parts["token_name"],
             token_value=token_secret,
             verify_ssl=verify,
-            timeout=timeout,
+            # (connect, read): a down node is detected in connect_timeout instead of the full read timeout.
+            timeout=(connect_timeout, timeout),
         )
+        if self.fallback_urls:
+            self._install_failover(self.fallback_urls)
+
+    def _install_failover(self, fallback_urls: List[str]) -> None:
+        """Route requests through a session that moves to the next cluster node's API when one is unreachable."""
+        store = getattr(self._api, "_store", None)
+        old = store.get("session") if isinstance(store, dict) else None
+        if not isinstance(old, ProxmoxHttpSession):
+            print("proxmox-mcp: this proxmoxer version can't switch API URLs; fallback API URLs ignored", file=sys.stderr, flush=True)
+            return
+        prefixes = [store["base_url"]]
+        for fallback in fallback_urls:
+            parts = parse_api_url(fallback)
+            host = f"[{parts['host']}]" if ":" in parts["host"] else parts["host"]
+            prefix = f"https://{host}:{parts['port']}/api2/json"  # the form proxmoxer builds for the primary
+            if prefix not in prefixes:
+                prefixes.append(prefix)
+        if len(prefixes) < 2:
+            return
+        session = _FailoverSession(prefixes)
+        session.auth = old.auth  # the cluster's API token is valid on every node
+        session.cert = old.cert
+        session.headers.update(old.headers)
+        old.close()
+        # Every resource proxmoxer derives from self._api copies this store, so all requests go through the new session.
+        store["session"] = session
 
     @classmethod
     def from_env(cls) -> "ProxmoxClient":
@@ -57,6 +172,7 @@ class ProxmoxClient:
             default_node=env.default_node,
             default_storage=env.default_storage,
             default_bridge=env.default_bridge,
+            fallback_urls=env.fallback_urls,
         )
 
     # Low-level accessor
@@ -111,7 +227,9 @@ class ProxmoxClient:
             if kinds == ("qemu",) and any(r.get("type") == "lxc" for r in matches):
                 raise ValueError(
                     f"{selector} is an LXC container, not a QEMU VM. Container tools: proxmox-lxc-info, proxmox-start-lxc, "
-                    "proxmox-stop-lxc, proxmox-configure-lxc, proxmox-delete-lxc, proxmox-lxc-notes-*, proxmox-backup-vm. "
+                    "proxmox-stop-lxc, proxmox-configure-lxc, proxmox-delete-lxc, proxmox-lxc-notes-*; these also take "
+                    "containers: proxmox-backup-vm, proxmox-reboot-vm, proxmox-shutdown-vm, proxmox-list/create/delete/"
+                    "rollback-snapshot, proxmox-vm-metrics, proxmox-vm-firewall-get/-set. "
                     "Proxmox has no exec API for containers; run `pct exec <vmid> -- <cmd>` on the node instead of guest-exec."
                 )
             if kinds == ("lxc",) and any(r.get("type") == "qemu" for r in matches):
@@ -133,6 +251,14 @@ class ProxmoxClient:
         """Resolve a VM or container for type-agnostic endpoints (e.g. vzdump); row["type"] is "qemu" or "lxc"."""
         return self._resolve_guest(("qemu", "lxc"), vmid, name, node)
 
+    def _guest(self, node: str, vmid: int, kind: str = "qemu"):
+        """/nodes/{node}/qemu/{vmid} or /nodes/{node}/lxc/{vmid}; snapshot, status, rrddata and firewall sit under both."""
+        if kind == "qemu":
+            return self._api.nodes(node).qemu(vmid)
+        if kind == "lxc":
+            return self._api.nodes(node).lxc(vmid)
+        raise ValueError(f"Unknown guest type {kind!r}; expected 'qemu' or 'lxc'")
+
     def vm_config(self, node: str, vmid: int) -> Dict[str, Any]:
         return self._api.nodes(node).qemu(vmid).config.get()
 
@@ -153,11 +279,26 @@ class ProxmoxClient:
         return [n for n in nets if n.get("type") == "bridge" or str(n.get("iface", "")).startswith("vmbr")]
 
     def list_tasks(self, node: Optional[str] = None, user: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
-        tasks = self._api.cluster.tasks.get()
+        # /cluster/tasks holds only each node's last ~25 tasks, unsorted, so truncating it can drop a busy node's
+        # newer tasks in favour of an idle node's older ones. Merge in each node's own newest `limit` tasks
+        # (running ones included), then sort newest first before applying the limit.
+        merged = {t["upid"]: t for t in self._api.cluster.tasks.get() if t.get("upid")}
+        nodes = [node] if node else [n["node"] for n in self._api.nodes.get() if n.get("status") == "online"]
+        params: Dict[str, Any] = {"limit": max(int(limit), 1), "source": "all"}
+        if user:
+            params["userfilter"] = user  # substring match on the node; the exact match is applied below
+        for n in nodes:
+            try:
+                rows = self._api.nodes(n).tasks.get(**params)
+            except Exception:
+                continue  # node unreachable (e.g. 595 while it is down): keep its /cluster/tasks rows
+            merged.update({t["upid"]: t for t in rows if t.get("upid")})
+        tasks = list(merged.values())
         if node:
             tasks = [t for t in tasks if t.get("node") == node]
         if user:
             tasks = [t for t in tasks if t.get("user") == user]
+        tasks.sort(key=lambda t: int(t.get("starttime") or 0), reverse=True)
         return tasks[:limit]
 
     def task_status(self, upid: str, node: Optional[str] = None) -> Dict[str, Any]:
@@ -242,14 +383,19 @@ class ProxmoxClient:
             params["timeout"] = int(timeout)
         return self._api.nodes(node).qemu(vmid).status.stop.post(**params)
 
-    def reboot_vm(self, node: str, vmid: int) -> str:
-        return self._api.nodes(node).qemu(vmid).status.reboot.post()
-
-    def shutdown_vm(self, node: str, vmid: int, timeout: Optional[int] = None) -> str:
+    def reboot_vm(self, node: str, vmid: int, timeout: Optional[int] = None, kind: str = "qemu") -> str:
         params: Dict[str, Any] = {}
         if timeout is not None:
             params["timeout"] = int(timeout)
-        return self._api.nodes(node).qemu(vmid).status.shutdown.post(**params)
+        return self._guest(node, vmid, kind).status.reboot.post(**params)
+
+    def shutdown_vm(self, node: str, vmid: int, timeout: Optional[int] = None, force_stop: bool = False, kind: str = "qemu") -> str:
+        params: Dict[str, Any] = {}
+        if timeout is not None:
+            params["timeout"] = int(timeout)
+        if force_stop:
+            params["forceStop"] = 1  # hard-stop if the guest hasn't shut down when the timeout expires
+        return self._guest(node, vmid, kind).status.shutdown.post(**params)
 
     def migrate_vm(self, node: str, vmid: int, target_node: str, online: bool = True) -> str:
         return self._api.nodes(node).qemu(vmid).migrate.post(target=target_node, online=int(online))
@@ -349,20 +495,22 @@ class ProxmoxClient:
         upid = self._api.nodes(node).qemu(vmid).config.put(delete=f"net{slot}")
         return {"upid": upid, "removed": f"net{slot}"}
 
-    def vm_firewall_get(self, node: str, vmid: int) -> Dict[str, Any]:
-        opts = self._api.nodes(node).qemu(vmid).firewall.options.get()
-        rules = self._api.nodes(node).qemu(vmid).firewall.rules.get()
+    def vm_firewall_get(self, node: str, vmid: int, kind: str = "qemu") -> Dict[str, Any]:
+        firewall = self._guest(node, vmid, kind).firewall
+        opts = firewall.options.get()
+        rules = firewall.rules.get()
         return {"options": opts, "rules": rules}
 
-    def vm_firewall_set(self, node: str, vmid: int, enable: Optional[bool] = None, rules: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    def vm_firewall_set(self, node: str, vmid: int, enable: Optional[bool] = None, rules: Optional[List[Dict[str, Any]]] = None, kind: str = "qemu") -> Dict[str, Any]:
+        firewall = self._guest(node, vmid, kind).firewall
         result: Dict[str, Any] = {}
         if enable is not None:
-            upid = self._api.nodes(node).qemu(vmid).firewall.options.put(enable=int(enable))
+            upid = firewall.options.put(enable=int(enable))
             result["options_upid"] = upid
         if rules:
             # Very simple approach: append new rules at the end
             for rule in rules:
-                self._api.nodes(node).qemu(vmid).firewall.rules.post(**rule)
+                firewall.rules.post(**rule)
             result["rules_added"] = len(rules)
         return result
 
@@ -378,20 +526,25 @@ class ProxmoxClient:
     def template_vm(self, node: str, vmid: int) -> str:
         return self._api.nodes(node).qemu(vmid).template.post()
 
-    def list_snapshots(self, node: str, vmid: int) -> List[Dict[str, Any]]:
-        return self._api.nodes(node).qemu(vmid).snapshot.get()
+    def list_snapshots(self, node: str, vmid: int, kind: str = "qemu") -> List[Dict[str, Any]]:
+        return self._guest(node, vmid, kind).snapshot.get()
 
-    def create_snapshot(self, node: str, vmid: int, name: str, description: Optional[str] = None, vmstate: bool = False) -> str:
-        params: Dict[str, Any] = {"snapname": name, "vmstate": int(vmstate)}
+    def create_snapshot(self, node: str, vmid: int, name: str, description: Optional[str] = None, vmstate: bool = False, kind: str = "qemu") -> str:
+        params: Dict[str, Any] = {"snapname": name}
+        if kind == "lxc":
+            if vmstate:
+                raise ValueError("vmstate (RAM state) snapshots exist only for QEMU VMs, not LXC containers")
+        else:
+            params["vmstate"] = int(vmstate)
         if description:
             params["description"] = description
-        return self._api.nodes(node).qemu(vmid).snapshot.post(**params)
+        return self._guest(node, vmid, kind).snapshot.post(**params)
 
-    def delete_snapshot(self, node: str, vmid: int, name: str) -> str:
-        return self._api.nodes(node).qemu(vmid).snapshot(name).delete()
+    def delete_snapshot(self, node: str, vmid: int, name: str, kind: str = "qemu") -> str:
+        return self._guest(node, vmid, kind).snapshot(name).delete()
 
-    def rollback_snapshot(self, node: str, vmid: int, name: str) -> str:
-        return self._api.nodes(node).qemu(vmid).snapshot(name).rollback.post()
+    def rollback_snapshot(self, node: str, vmid: int, name: str, kind: str = "qemu") -> str:
+        return self._guest(node, vmid, kind).snapshot(name).rollback.post()
 
     def backup_vm(self, node: str, vmid: int, mode: str = "snapshot", compress: str = "zstd", storage: Optional[str] = None) -> str:
         params: Dict[str, Any] = {"vmid": vmid, "mode": mode, "compress": compress}
@@ -428,8 +581,8 @@ class ProxmoxClient:
         return self._api.nodes(node).qemu.post(archive=archive, **params)
 
     # -------- Metrics --------
-    def vm_metrics(self, node: str, vmid: int, timeframe: str = "hour", cf: str = "AVERAGE") -> List[Dict[str, Any]]:
-        return self._api.nodes(node).qemu(vmid).rrddata.get(timeframe=timeframe, cf=cf)
+    def vm_metrics(self, node: str, vmid: int, timeframe: str = "hour", cf: str = "AVERAGE", kind: str = "qemu") -> List[Dict[str, Any]]:
+        return self._guest(node, vmid, kind).rrddata.get(timeframe=timeframe, cf=cf)
 
     def node_metrics(self, node: str, timeframe: str = "hour", cf: str = "AVERAGE") -> List[Dict[str, Any]]:
         return self._api.nodes(node).rrddata.get(timeframe=timeframe, cf=cf)

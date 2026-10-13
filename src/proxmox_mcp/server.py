@@ -467,18 +467,20 @@ async def proxmox_stop_vm(vmid: Optional[int] = None, name: Optional[str] = None
 
 
 @server.tool("proxmox-reboot-vm")
-async def proxmox_reboot_vm(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None) -> Dict[str, Any]:
+async def proxmox_reboot_vm(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
+    """Reboot a QEMU VM or LXC container (clean shutdown, then start); timeout caps the wait for the shutdown."""
     client = get_client()
-    vm_vmid, vm_node, _ = client.resolve_vm(vmid=vmid, name=name, node=node)
-    upid = client.reboot_vm(vm_node, vm_vmid)
+    vm_vmid, vm_node, vm = client.resolve_guest(vmid=vmid, name=name, node=node)
+    upid = client.reboot_vm(vm_node, vm_vmid, timeout=timeout, kind=vm["type"])
     return {"upid": upid}
 
 
 @server.tool("proxmox-shutdown-vm")
-async def proxmox_shutdown_vm(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None, timeout: Optional[int] = None, wait: bool = False, poll_interval: float = 2.0) -> Dict[str, Any]:
+async def proxmox_shutdown_vm(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None, timeout: Optional[int] = None, force_stop: bool = False, wait: bool = False, poll_interval: float = 2.0) -> Dict[str, Any]:
+    """Cleanly shut down a QEMU VM or LXC container; force_stop hard-stops it if still running after timeout."""
     client = get_client()
-    vm_vmid, vm_node, _ = client.resolve_vm(vmid=vmid, name=name, node=node)
-    upid = client.shutdown_vm(vm_node, vm_vmid, timeout=timeout)
+    vm_vmid, vm_node, vm = client.resolve_guest(vmid=vmid, name=name, node=node)
+    upid = client.shutdown_vm(vm_node, vm_vmid, timeout=timeout, force_stop=force_stop, kind=vm["type"])
     result: Dict[str, Any] = {"upid": upid}
     if wait:
         status = client.wait_task(upid, node=vm_node, timeout=timeout or 600, poll_interval=poll_interval)
@@ -699,21 +701,23 @@ async def proxmox_vm_nic_remove(vmid: Optional[int] = None, name: Optional[str] 
 
 @server.tool("proxmox-vm-firewall-get")
 async def proxmox_vm_firewall_get(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None) -> Dict[str, Any]:
+    """Firewall options and rules of a QEMU VM or LXC container."""
     client = get_client()
-    vm_vmid, vm_node, _ = client.resolve_vm(vmid=vmid, name=name, node=node)
-    return client.vm_firewall_get(vm_node, vm_vmid)
+    vm_vmid, vm_node, vm = client.resolve_guest(vmid=vmid, name=name, node=node)
+    return client.vm_firewall_get(vm_node, vm_vmid, kind=vm["type"])
 
 
 @server.tool("proxmox-vm-firewall-set")
 async def proxmox_vm_firewall_set(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None, enable: Optional[bool] = None, rules: Optional[List[Dict[str, Any]]] = None, confirm: Optional[bool] = None, dry_run: bool = False) -> Dict[str, Any]:
+    """Enable/disable the firewall of a QEMU VM or LXC container and/or append rules."""
     client = get_client()
-    vm_vmid, vm_node, _ = client.resolve_vm(vmid=vmid, name=name, node=node)
+    vm_vmid, vm_node, vm = client.resolve_guest(vmid=vmid, name=name, node=node)
     if enable is None and not rules:
         raise ValueError("Provide enable and/or rules")
     require_confirm(confirm)
     if dry_run:
-        return {"dry_run": True, "action": "vm-firewall-set", "params": {"node": vm_node, "vmid": vm_vmid, "enable": enable, "rules": rules or []}}
-    return client.vm_firewall_set(vm_node, vm_vmid, enable=enable, rules=rules)
+        return {"dry_run": True, "action": "vm-firewall-set", "params": {"node": vm_node, "vmid": vm_vmid, "type": vm["type"], "enable": enable, "rules": rules or []}}
+    return client.vm_firewall_set(vm_node, vm_vmid, enable=enable, rules=rules, kind=vm["type"])
 
 
 # ---------- Images, templates, snapshots, backups ----------
@@ -763,47 +767,53 @@ async def proxmox_template_vm(vmid: Optional[int] = None, name: Optional[str] = 
 
 @server.tool("proxmox-list-snapshots")
 async def proxmox_list_snapshots(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List snapshots of a QEMU VM or LXC container."""
     client = get_client()
-    vm_vmid, vm_node, _ = client.resolve_vm(vmid=vmid, name=name, node=node)
-    return client.list_snapshots(vm_node, vm_vmid)
+    vm_vmid, vm_node, vm = client.resolve_guest(vmid=vmid, name=name, node=node)
+    return client.list_snapshots(vm_node, vm_vmid, kind=vm["type"])
 
 
 @server.tool("proxmox-create-snapshot")
 async def proxmox_create_snapshot(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None, snapname: str = "", description: Optional[str] = None, vmstate: bool = False, confirm: Optional[bool] = None, dry_run: bool = False) -> Dict[str, Any]:
+    """Snapshot a QEMU VM or LXC container; vmstate (include RAM) is VM-only."""
     client = get_client()
-    vm_vmid, vm_node, _ = client.resolve_vm(vmid=vmid, name=name, node=node)
+    vm_vmid, vm_node, vm = client.resolve_guest(vmid=vmid, name=name, node=node)
     if not snapname:
         raise ValueError("snapname is required")
+    if vmstate and vm["type"] == "lxc":
+        raise ValueError("vmstate (RAM state) snapshots exist only for QEMU VMs, not LXC containers")
     require_confirm(confirm)
     if dry_run:
-        return {"dry_run": True, "action": "create-snapshot", "params": {"node": vm_node, "vmid": vm_vmid, "snapname": snapname, "description": description, "vmstate": vmstate}}
-    upid = client.create_snapshot(vm_node, vm_vmid, name=snapname, description=description, vmstate=vmstate)
+        return {"dry_run": True, "action": "create-snapshot", "params": {"node": vm_node, "vmid": vm_vmid, "type": vm["type"], "snapname": snapname, "description": description, "vmstate": vmstate}}
+    upid = client.create_snapshot(vm_node, vm_vmid, name=snapname, description=description, vmstate=vmstate, kind=vm["type"])
     return {"upid": upid}
 
 
 @server.tool("proxmox-delete-snapshot")
 async def proxmox_delete_snapshot(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None, snapname: str = "", confirm: Optional[bool] = None, dry_run: bool = False) -> Dict[str, Any]:
+    """Delete a snapshot of a QEMU VM or LXC container."""
     client = get_client()
-    vm_vmid, vm_node, _ = client.resolve_vm(vmid=vmid, name=name, node=node)
+    vm_vmid, vm_node, vm = client.resolve_guest(vmid=vmid, name=name, node=node)
     if not snapname:
         raise ValueError("snapname is required")
     require_confirm(confirm)
     if dry_run:
-        return {"dry_run": True, "action": "delete-snapshot", "params": {"node": vm_node, "vmid": vm_vmid, "snapname": snapname}}
-    upid = client.delete_snapshot(vm_node, vm_vmid, name=snapname)
+        return {"dry_run": True, "action": "delete-snapshot", "params": {"node": vm_node, "vmid": vm_vmid, "type": vm["type"], "snapname": snapname}}
+    upid = client.delete_snapshot(vm_node, vm_vmid, name=snapname, kind=vm["type"])
     return {"upid": upid}
 
 
 @server.tool("proxmox-rollback-snapshot")
 async def proxmox_rollback_snapshot(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None, snapname: str = "", confirm: Optional[bool] = None, dry_run: bool = False, wait: bool = True, timeout: int = 900, poll_interval: float = 2.0) -> Dict[str, Any]:
+    """Roll a QEMU VM or LXC container back to a snapshot (discards everything since it)."""
     client = get_client()
-    vm_vmid, vm_node, _ = client.resolve_vm(vmid=vmid, name=name, node=node)
+    vm_vmid, vm_node, vm = client.resolve_guest(vmid=vmid, name=name, node=node)
     if not snapname:
         raise ValueError("snapname is required")
     require_confirm(confirm)
     if dry_run:
-        return {"dry_run": True, "action": "rollback-snapshot", "params": {"node": vm_node, "vmid": vm_vmid, "snapname": snapname}}
-    upid = client.rollback_snapshot(vm_node, vm_vmid, name=snapname)
+        return {"dry_run": True, "action": "rollback-snapshot", "params": {"node": vm_node, "vmid": vm_vmid, "type": vm["type"], "snapname": snapname}}
+    upid = client.rollback_snapshot(vm_node, vm_vmid, name=snapname, kind=vm["type"])
     result: Dict[str, Any] = {"upid": upid}
     if wait:
         status = client.wait_task(upid, node=vm_node, timeout=timeout, poll_interval=poll_interval)
@@ -849,9 +859,10 @@ async def proxmox_restore_vm(node: Optional[str] = None, vmid: int = 0, archive:
 
 @server.tool("proxmox-vm-metrics")
 async def proxmox_vm_metrics(vmid: Optional[int] = None, name: Optional[str] = None, node: Optional[str] = None, timeframe: str = "hour", cf: str = "AVERAGE") -> List[Dict[str, Any]]:
+    """RRD metrics (CPU, memory, disk, network) of a QEMU VM or LXC container."""
     client = get_client()
-    vm_vmid, vm_node, _ = client.resolve_vm(vmid=vmid, name=name, node=node)
-    return client.vm_metrics(vm_node, vm_vmid, timeframe=timeframe, cf=cf)
+    vm_vmid, vm_node, vm = client.resolve_guest(vmid=vmid, name=name, node=node)
+    return client.vm_metrics(vm_node, vm_vmid, timeframe=timeframe, cf=cf, kind=vm["type"])
 
 
 @server.tool("proxmox-node-metrics")
